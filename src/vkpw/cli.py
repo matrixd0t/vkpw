@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", metavar="FILE", help="JSON-файл для cookies")
     parser.add_argument("--login", help="Логин (пароль безопасно запрашивается отдельно)")
     parser.add_argument(
+        "credentials",
+        nargs="?",
+        metavar="LOGIN:PASSWORD",
+        help="Логин и пароль одной строкой (требует явный -o/--output)",
+    )
+    parser.add_argument(
         "--browser-path",
         metavar="PATH",
         help="Путь к установленному Chromium/Chrome/Edge/Brave",
@@ -35,6 +41,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
+
+
+def _parse_credentials(value: str) -> tuple[str, str]:
+    login, separator, password = value.partition(":")
+    if not separator:
+        raise VkpwError("Ожидается формат LOGIN:PASSWORD")
+
+    login = login.strip()
+    password = "".join(password.split())
+    if not login or not password:
+        raise VkpwError("Логин и пароль не должны быть пустыми")
+    return login, password
 
 
 def _read_line(prompt: str) -> str:
@@ -85,16 +103,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(arguments)
     if args.timeout <= 0:
         parser.error("--timeout должен быть больше нуля")
-    if not sys.stdin.isatty():
-        print("Ошибка: vkpw требует интерактивный терминал для ввода логина и пароля", file=sys.stderr)
-        return 2
+    if args.credentials is not None and args.login is not None:
+        parser.error("укажите либо LOGIN:PASSWORD, либо --login")
+    if args.credentials is not None and args.output is None:
+        parser.error("для LOGIN:PASSWORD обязательно явно укажите -o/--output")
 
-    login = args.login or _read_line("Логин VK (телефон или почта): ")
-    if not login:
-        print("Ошибка: логин не задан", file=sys.stderr)
-        return 2
+    if args.credentials is not None:
+        try:
+            login, password = _parse_credentials(args.credentials)
+        except VkpwError as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+            return 2
+    else:
+        if not sys.stdin.isatty():
+            print(
+                "Ошибка: vkpw требует интерактивный терминал для ввода логина и пароля",
+                file=sys.stderr,
+            )
+            return 2
+        login = args.login or _read_line("Логин VK (телефон или почта): ")
+        if not login:
+            print("Ошибка: логин не задан", file=sys.stderr)
+            return 2
+        password = None
+
     try:
-        password = getpass.getpass("Пароль VK: ")
+        if password is None:
+            password = getpass.getpass("Пароль VK: ")
         user_id, cookies = asyncio.run(_run_login(args, login=login, password=password))
         entry = build_entry(cookies, user_id)
         target = args.output
