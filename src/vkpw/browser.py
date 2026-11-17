@@ -111,6 +111,7 @@ async def launch_chromium(
             ) from exc
 
     raise BrowserNotFoundError(
-        "Не найден Chromium, Chrome, Edge или Brave. Установите один из них либо выполните "
-        "`vkpw install-browser` для загрузки Chromium."
+        f"Не найден Chromium, Chrome, Edge или Brave. Playwright ожидает Chromium по пути "
+        f"{bundled}. Установите браузер командой `vkpw install-browser` и запускайте установку "
+        "и авторизацию от одного пользователя с одинаковым значением PLAYWRIGHT_BROWSERS_PATH."
     )

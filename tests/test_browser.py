@@ -54,6 +54,12 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BrowserNotFoundError):
             await launch_chromium(FakePlaywright(), browser_path="missing-browser")
 
+    async def test_missing_playwright_browser_reports_expected_path(self) -> None:
+        playwright = FakePlaywright()
+        with patch("vkpw.browser.find_system_browser", return_value=None):
+            with self.assertRaisesRegex(BrowserNotFoundError, "unused-managed-browser"):
+                await launch_chromium(playwright)
+
     def test_explicit_browser_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             browser_path = Path(directory) / "chrome"

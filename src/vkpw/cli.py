@@ -85,8 +85,34 @@ def _install_browser() -> int:
     if result.returncode:
         print("Ошибка: Playwright не смог установить Chromium", file=sys.stderr)
         return result.returncode
-    print("Chromium установлен.", file=sys.stderr)
+
+    try:
+        browser_path = _playwright_chromium_path()
+    except Exception as exc:
+        print(
+            "Ошибка: Playwright завершил установку, но не удалось проверить путь Chromium "
+            f"({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return 1
+    if not browser_path.is_file():
+        print(
+            "Ошибка: Playwright сообщил об успешной установке, но исполняемый файл Chromium "
+            f"не найден: {browser_path}. Проверьте пользователя и переменную "
+            "PLAYWRIGHT_BROWSERS_PATH.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Chromium установлен: {browser_path}", file=sys.stderr)
     return 0
+
+
+def _playwright_chromium_path() -> Path:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        return Path(playwright.chromium.executable_path)
 
 
 async def _run_login(args: argparse.Namespace, *, login: str, password: str) -> tuple[int, dict[str, str]]:

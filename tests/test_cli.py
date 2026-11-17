@@ -8,7 +8,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from vkpw.cli import _parse_credentials, main
+from vkpw.cli import _install_browser, _parse_credentials, main
 from vkpw.errors import VkpwError
 
 
@@ -112,6 +112,38 @@ class CredentialsCliTests(unittest.TestCase):
             log_contents = log_file.read_text(encoding="utf-8")
             self.assertIn("Ошибка в процессе входа: VK отклонил вход", log_contents)
             self.assertNotIn("secret", log_contents)
+
+
+class BrowserInstallCliTests(unittest.TestCase):
+    def test_install_browser_confirms_the_managed_executable_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            browser_path = Path(directory) / "chrome"
+            browser_path.touch()
+            stderr = io.StringIO()
+            with (
+                patch("vkpw.cli.subprocess.run", return_value=Mock(returncode=0)),
+                patch("vkpw.cli._playwright_chromium_path", return_value=browser_path),
+                redirect_stderr(stderr),
+            ):
+                result = _install_browser()
+
+            self.assertEqual(result, 0)
+            self.assertIn(str(browser_path), stderr.getvalue())
+
+    def test_install_browser_does_not_report_success_without_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            browser_path = Path(directory) / "missing-chrome"
+            stderr = io.StringIO()
+            with (
+                patch("vkpw.cli.subprocess.run", return_value=Mock(returncode=0)),
+                patch("vkpw.cli._playwright_chromium_path", return_value=browser_path),
+                redirect_stderr(stderr),
+            ):
+                result = _install_browser()
+
+            self.assertEqual(result, 1)
+            self.assertIn(str(browser_path), stderr.getvalue())
+            self.assertIn("PLAYWRIGHT_BROWSERS_PATH", stderr.getvalue())
 
 
 if __name__ == "__main__":
