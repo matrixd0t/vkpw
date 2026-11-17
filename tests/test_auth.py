@@ -143,10 +143,17 @@ class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
                 return_value=session.cookies,
             ),
             patch("vkpw.auth.verify_session", return_value=session),
+            self.assertLogs("vkpw.auth", level="INFO") as logs,
         ):
             result = await authenticate("1234567890", "secret")
 
         self.assertEqual(result, session)
+        log_contents = "\n".join(logs.output)
+        self.assertIn("Этап пройден: страница VK ID загружена", log_contents)
+        self.assertIn("Этап пройден: пароль отправлен", log_contents)
+        self.assertIn("Этап пройден: сессия подтверждена VK", log_contents)
+        self.assertNotIn("secret", log_contents)
+        self.assertNotIn("p-value", log_contents)
         browser.new_context.assert_awaited_once_with(locale="ru-RU")
         browser.context.add_cookies.assert_awaited_once_with(
             [

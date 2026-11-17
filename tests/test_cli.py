@@ -32,9 +32,9 @@ class CredentialsCliTests(unittest.TestCase):
             patch("vkpw.cli._setup_streams"),
             patch("vkpw.cli.sys.stdin", Mock(isatty=Mock(return_value=False))),
             redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
         ):
-            with self.assertRaises(SystemExit) as raised:
-                main(["login:secret"])
+            main(["login:secret"])
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("обязательно явно укажите -o/--output", stderr.getvalue())
@@ -62,6 +62,56 @@ class CredentialsCliTests(unittest.TestCase):
             saved = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(saved["cookies"][0]["user_id"], 123)
             self.assertNotIn("secret", stderr.getvalue())
+
+    def test_log_file_records_progress_without_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "cookies.json"
+            log_file = Path(directory) / "vkpw.log"
+            with (
+                patch("vkpw.cli._setup_streams"),
+                patch("vkpw.cli.sys.stdin", Mock(isatty=Mock(return_value=False))),
+                patch(
+                    "vkpw.cli._run_login",
+                    new_callable=AsyncMock,
+                    return_value=(123, {"p": "private-p", "remixsid": "private-sid"}),
+                ),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = main(
+                    ["login:secret", "-o", str(output), "-l", str(log_file)]
+                )
+
+            self.assertEqual(result, 0)
+            log_contents = log_file.read_text(encoding="utf-8")
+            self.assertIn("Запуск процесса входа", log_contents)
+            self.assertIn("Начинаю авторизацию VK", log_contents)
+            self.assertIn("Авторизация VK завершена", log_contents)
+            self.assertIn("Cookies успешно сохранены", log_contents)
+            for secret in ("secret", "private-p", "private-sid"):
+                self.assertNotIn(secret, log_contents)
+
+    def test_log_file_records_authentication_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "cookies.json"
+            log_file = Path(directory) / "vkpw.log"
+            with (
+                patch("vkpw.cli._setup_streams"),
+                patch("vkpw.cli.sys.stdin", Mock(isatty=Mock(return_value=False))),
+                patch(
+                    "vkpw.cli._run_login",
+                    new_callable=AsyncMock,
+                    side_effect=VkpwError("VK отклонил вход"),
+                ),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = main(
+                    ["login:secret", "-o", str(output), "-l", str(log_file)]
+                )
+
+            self.assertEqual(result, 1)
+            log_contents = log_file.read_text(encoding="utf-8")
+            self.assertIn("Ошибка в процессе входа: VK отклонил вход", log_contents)
+            self.assertNotIn("secret", log_contents)
 
 
 if __name__ == "__main__":

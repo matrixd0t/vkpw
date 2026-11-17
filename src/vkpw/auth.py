@@ -5,6 +5,7 @@ import base64
 import http.cookiejar
 import inspect
 import json
+import logging
 import re
 import secrets
 import string
@@ -57,6 +58,8 @@ _LOGIN_ERROR_MARKERS = (
     "incorrect password",
     "wrong password",
 )
+
+logger = logging.getLogger(__name__)
 
 ManualChallengeHandler = Callable[[], Any]
 
@@ -150,17 +153,23 @@ def _request_json(
     timeout: float,
     label: str,
 ) -> Any:
+    logger.info("Этап начат: запрос VK %s", label)
     try:
         with opener.open(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
+        logger.info("Этап завершился ошибкой: запрос VK %s (HTTP %s)", label, exc.code)
         raise VkpwError(f"{label}: VK вернул HTTP {exc.code}") from None
     except urllib.error.URLError as exc:
+        logger.info("Этап завершился ошибкой: запрос VK %s (сетевая ошибка)", label)
         raise VkpwError(f"{label}: сетевая ошибка ({type(exc.reason).__name__})") from None
     except OSError as exc:
+        logger.info("Этап завершился ошибкой: запрос VK %s (сетевая ошибка)", label)
         raise VkpwError(f"{label}: сетевая ошибка ({type(exc).__name__})") from None
     except (UnicodeError, ValueError, TypeError) as exc:
+        logger.info("Этап завершился ошибкой: некорректный ответ VK %s", label)
         raise VkpwError(f"{label}: VK вернул некорректный ответ") from exc
+    logger.info("Этап пройден: запрос VK %s", label)
     return payload
 
 
@@ -171,7 +180,13 @@ def verify_session(
     opener: Any | None = None,
 ) -> BrowserSession:
     """Проверить cookies через web_token и users.get, как ожидает vkx/vkqr."""
-    jar = _cookie_jar(cookies)
+    logger.info("Этап начат: проверка cookies сессии")
+    try:
+        jar = _cookie_jar(cookies)
+    except VkpwError as exc:
+        logger.info("Этап завершился ошибкой: проверка cookies сессии (%s)", exc)
+        raise
+    logger.info("Этап пройден: обязательные cookies сессии получены")
     client = opener or urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
 
     web_token_request = urllib.request.Request(
@@ -191,12 +206,16 @@ def verify_session(
         timeout=timeout,
         label="web_token",
     )
+    logger.info("Этап начат: проверка ответа web_token")
     try:
         access_token = web_token_payload["data"]["access_token"]
     except (KeyError, TypeError) as exc:
+        logger.info("Этап завершился ошибкой: проверка ответа web_token")
         raise VkpwError("VK не принял cookies или не выдал веб-токен") from exc
     if not isinstance(access_token, str) or not access_token:
+        logger.info("Этап завершился ошибкой: проверка ответа web_token")
         raise VkpwError("VK не выдал веб-токен для проверки cookies")
+    logger.info("Этап пройден: ответ web_token проверен")
 
     users_url = f"{API_HOST}/method/users.get?{urllib.parse.urlencode({'v': API_VERSION})}"
     users_request = urllib.request.Request(
@@ -211,19 +230,25 @@ def verify_session(
         method="POST",
     )
     users_payload = _request_json(client, users_request, timeout=timeout, label="users.get")
+    logger.info("Этап начат: проверка ответа users.get")
     if not isinstance(users_payload, dict):
+        logger.info("Этап завершился ошибкой: проверка ответа users.get")
         raise VkpwError("users.get вернул неожиданный ответ")
     error = users_payload.get("error")
     if isinstance(error, dict):
+        logger.info("Этап завершился ошибкой: проверка ответа users.get")
         raise VkpwError("VK не подтвердил авторизацию cookies через users.get")
     users = users_payload.get("response", users_payload)
     if not isinstance(users, list) or not users or not isinstance(users[0], dict):
+        logger.info("Этап завершился ошибкой: проверка ответа users.get")
         raise VkpwError("users.get не вернул данные пользователя")
     try:
         user_id = int(users[0]["id"])
     except (KeyError, TypeError, ValueError) as exc:
+        logger.info("Этап завершился ошибкой: проверка ответа users.get")
         raise VkpwError("users.get не вернул корректный user_id") from exc
     if user_id <= 0:
+        logger.info("Этап завершился ошибкой: проверка ответа users.get")
         raise VkpwError("users.get вернул некорректный user_id")
 
     refreshed = {
@@ -232,6 +257,7 @@ def verify_session(
         if cookie.name in REQUIRED_COOKIES and cookie.value
     }
     checked_cookies = {name: refreshed.get(name, cookies[name]) for name in REQUIRED_COOKIES}
+    logger.info("Этап пройден: сессия VK подтверждена")
     return BrowserSession(user_id=user_id, cookies=checked_cookies)
 
 
@@ -266,6 +292,7 @@ async def _handle_manual_challenge(
 ) -> None:
     if not await _has_manual_challenge(page):
         return
+    logger.info("VK запросил дополнительную проверку; автоматический обход не выполняется")
     if handler is None:
         raise ManualVerificationRequired(
             "VK запросил CAPTCHA или дополнительное подтверждение. "
@@ -274,6 +301,7 @@ async def _handle_manual_challenge(
     result = handler()
     if inspect.isawaitable(result):
         await result
+    logger.info("Обработчик дополнительной проверки завершил работу")
 
 
 async def _wait_for_visible(
@@ -294,6 +322,7 @@ async def _wait_for_visible(
             raise VkpwError("VK отклонил логин или запрос на вход")
         if await _has_manual_challenge(page):
             if manual_challenge is None:
+                logger.info("VK запросил дополнительную проверку при ожидании этапа «%s»", description)
                 raise ManualVerificationRequired(
                     "VK запросил CAPTCHA или дополнительное подтверждение. "
                     "Автоматически такие проверки не обходятся."
@@ -329,6 +358,7 @@ async def _wait_for_session_cookies(
         cookies = extract_session_cookies(await context.cookies())
         if await _has_manual_challenge(page):
             if manual_challenge is None:
+                logger.info("VK запросил дополнительную проверку при ожидании cookies сессии")
                 raise ManualVerificationRequired(
                     "VK запросил CAPTCHA или дополнительное подтверждение. "
                     "Автоматически такие проверки не обходятся."
@@ -358,21 +388,34 @@ async def authenticate(
     manual_challenge: ManualChallengeHandler | None = None,
 ) -> BrowserSession:
     """Войти через штатную страницу VK ID и вернуть подтверждённые cookies."""
-    if not login.strip():
-        raise VkpwError("Логин не должен быть пустым")
-    if not password:
-        raise VkpwError("Пароль не должен быть пустым")
-    if timeout <= 0:
-        raise VkpwError("Таймаут должен быть больше нуля")
-
+    logger.info("Начата авторизация VK")
+    stage = "проверка входных данных"
+    cleanup_failed = False
     try:
+        if not login.strip():
+            raise VkpwError("Логин не должен быть пустым")
+        if not password:
+            raise VkpwError("Пароль не должен быть пустым")
+        if timeout <= 0:
+            raise VkpwError("Таймаут должен быть больше нуля")
+        logger.info("Этап пройден: проверка входных данных")
+
+        stage = "запуск Playwright"
         async with async_playwright() as playwright:
+            logger.info("Этап пройден: запуск Playwright")
+
+            stage = "запуск браузера"
             browser = await launch_chromium(
                 playwright,
                 browser_path=browser_path,
             )
+            logger.info("Этап пройден: браузер запущен в headless-режиме")
             try:
+                stage = "создание чистого контекста браузера"
                 context = await browser.new_context(locale="ru-RU")
+                logger.info("Этап пройден: создан новый временный контекст браузера")
+
+                stage = "установка начальной cookie устройства"
                 await context.add_cookies(
                     [
                         {
@@ -383,7 +426,13 @@ async def authenticate(
                         }
                     ]
                 )
+                logger.info("Этап пройден: начальная cookie устройства добавлена")
+
+                stage = "создание страницы браузера"
                 page = await context.new_page()
+                logger.info("Этап пройден: страница VK ID создана")
+
+                stage = "загрузка страницы VK ID"
                 try:
                     await page.goto(
                         build_auth_url(),
@@ -394,10 +443,16 @@ async def authenticate(
                     raise VkpwError(
                         f"Не удалось открыть страницу VK ID ({type(exc).__name__})"
                     ) from exc
-                await _handle_manual_challenge(page, manual_challenge)
 
+                logger.info("Этап пройден: страница VK ID загружена")
+                stage = "первичная проверка дополнительного подтверждения"
+                await _handle_manual_challenge(page, manual_challenge)
+                logger.info("Этап пройден: первичная проверка дополнительного подтверждения")
+
+                stage = "поиск формы логина"
                 login_field = page.locator('input[name="login"]')
                 if not await login_field.is_visible():
+                    stage = "переход к форме входа по логину"
                     enter_by_login = page.get_by_role(
                         "button",
                         name=re.compile(r"Войти.*телефону.*почте|phone or email", re.IGNORECASE),
@@ -408,6 +463,9 @@ async def authenticate(
                         raise VkpwError(
                             "Не нашёл на странице VK ID переход к входу по логину"
                         ) from exc
+                    logger.info("Этап пройден: выбран вход по логину VK ID")
+
+                    stage = "поиск поля логина"
                     login_field = await _wait_for_visible(
                         page,
                         'input[name="login"]',
@@ -415,19 +473,26 @@ async def authenticate(
                         timeout=timeout,
                         manual_challenge=manual_challenge,
                     )
+                logger.info("Этап пройден: поле логина доступно")
 
                 if not _PHONE_RE.fullmatch(login.strip()):
                     login_modes = page.locator('input[type="radio"][name="login-view"]')
                     if await login_modes.count() > 1:
+                        stage = "выбор режима ввода почты или логина"
                         try:
                             await login_modes.nth(1).check(timeout=5_000)
                         except PlaywrightError as exc:
                             raise VkpwError(
                                 "Не удалось выбрать ввод почты/логина вместо телефона"
                             ) from exc
+                        logger.info("Этап пройден: выбран режим ввода почты или логина")
 
+                stage = "отправка логина"
                 await login_field.fill(login.strip())
                 await _click_continue(page)
+                logger.info("Этап пройден: логин отправлен")
+
+                stage = "поиск поля пароля"
                 password_field = await _wait_for_visible(
                     page,
                     'input[name="password"]',
@@ -435,17 +500,55 @@ async def authenticate(
                     timeout=timeout,
                     manual_challenge=manual_challenge,
                 )
+                logger.info("Этап пройден: поле пароля доступно")
+
+                stage = "отправка пароля"
                 await password_field.fill(password)
                 await _click_continue(page)
+                logger.info("Этап пройден: пароль отправлен")
 
+                stage = "получение cookies сессии"
                 browser_cookies = await _wait_for_session_cookies(
                     page,
                     context,
                     timeout=timeout,
                     manual_challenge=manual_challenge,
                 )
-                return await asyncio.to_thread(verify_session, browser_cookies)
+                logger.info("Этап пройден: обязательные cookies сессии получены")
+
+                stage = "проверка сессии"
+                session = await asyncio.to_thread(verify_session, browser_cookies)
+                logger.info("Этап пройден: сессия подтверждена VK")
+                return session
             finally:
-                await browser.close()
+                logger.info("Этап начат: закрытие временного браузера")
+                try:
+                    await browser.close()
+                except Exception as exc:
+                    cleanup_failed = True
+                    logger.info(
+                        "Этап завершился ошибкой: закрытие временного браузера (%s)",
+                        type(exc).__name__,
+                    )
+                    raise
+                logger.info("Этап пройден: временный браузер закрыт")
+    except VkpwError as exc:
+        if not cleanup_failed:
+            logger.info("Этап завершился ошибкой: %s — %s", stage, exc)
+        raise
     except PlaywrightError as exc:
+        if not cleanup_failed:
+            logger.info(
+                "Этап завершился ошибкой: %s (ошибка управления браузером: %s)",
+                stage,
+                type(exc).__name__,
+            )
         raise VkpwError(f"Ошибка управления браузером ({type(exc).__name__})") from exc
+    except Exception as exc:
+        if not cleanup_failed:
+            logger.info(
+                "Этап завершился неожиданной ошибкой: %s (%s)",
+                stage,
+                type(exc).__name__,
+            )
+        raise

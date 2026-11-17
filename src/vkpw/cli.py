@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import logging
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -13,6 +14,8 @@ from .auth import DEFAULT_TIMEOUT, authenticate
 from .errors import VkpwError
 from .storage import append_entry, build_entry
 
+logger = logging.getLogger("vkpw")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -21,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Для установки Chromium, если нет Chrome/Edge/Brave: vkpw install-browser",
     )
     parser.add_argument("-o", "--output", metavar="FILE", help="JSON-файл для cookies")
+    parser.add_argument(
+        "-l",
+        "--log-file",
+        metavar="FILE",
+        help="файл для журнала этапов входа",
+    )
     parser.add_argument("--login", help="Логин (пароль безопасно запрашивается отдельно)")
     parser.add_argument(
         "credentials",
@@ -101,49 +110,91 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(arguments)
-    if args.timeout <= 0:
-        parser.error("--timeout должен быть больше нуля")
-    if args.credentials is not None and args.login is not None:
-        parser.error("укажите либо LOGIN:PASSWORD, либо --login")
-    if args.credentials is not None and args.output is None:
-        parser.error("для LOGIN:PASSWORD обязательно явно укажите -o/--output")
-
-    if args.credentials is not None:
+    log_handler = None
+    previous_level = logger.level
+    previous_propagate = logger.propagate
+    if args.log_file:
         try:
-            login, password = _parse_credentials(args.credentials)
-        except VkpwError as exc:
-            print(f"Ошибка: {exc}", file=sys.stderr)
-            return 2
-    else:
-        if not sys.stdin.isatty():
-            print(
-                "Ошибка: vkpw требует интерактивный терминал для ввода логина и пароля",
-                file=sys.stderr,
+            log_handler = logging.FileHandler(
+                Path(args.log_file).expanduser(),
+                encoding="utf-8",
             )
+        except OSError as exc:
+            print(f"Ошибка: не удалось открыть файл журнала: {exc}", file=sys.stderr)
             return 2
-        login = args.login or _read_line("Логин VK (телефон или почта): ")
-        if not login:
-            print("Ошибка: логин не задан", file=sys.stderr)
-            return 2
-        password = None
+        log_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        logger.addHandler(log_handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
 
     try:
+        logger.info("Запуск процесса входа")
+        if args.timeout <= 0:
+            logger.info("Ошибка проверки аргументов: таймаут должен быть больше нуля")
+            parser.error("--timeout должен быть больше нуля")
+        if args.credentials is not None and args.login is not None:
+            logger.info("Ошибка проверки аргументов: переданы оба способа указания логина")
+            parser.error("укажите либо LOGIN:PASSWORD, либо --login")
+        if args.credentials is not None and args.output is None:
+            logger.info("Ошибка проверки аргументов: для LOGIN:PASSWORD нужен файл вывода")
+            parser.error("для LOGIN:PASSWORD обязательно явно укажите -o/--output")
+
+        if args.credentials is not None:
+            try:
+                login, password = _parse_credentials(args.credentials)
+            except VkpwError as exc:
+                logger.info("Не удалось разобрать учетные данные: %s", exc)
+                print(f"Ошибка: {exc}", file=sys.stderr)
+                return 2
+        else:
+            if not sys.stdin.isatty():
+                logger.info("Не удалось получить учетные данные: терминал не интерактивный")
+                print(
+                    "Ошибка: vkpw требует интерактивный терминал для ввода логина и пароля",
+                    file=sys.stderr,
+                )
+                return 2
+            login = args.login or _read_line("Логин VK (телефон или почта): ")
+            if not login:
+                logger.info("Не удалось получить учетные данные: логин не задан")
+                print("Ошибка: логин не задан", file=sys.stderr)
+                return 2
+            password = None
+
         if password is None:
             password = getpass.getpass("Пароль VK: ")
+        logger.info("Начинаю авторизацию VK")
         user_id, cookies = asyncio.run(_run_login(args, login=login, password=password))
+        logger.info("Авторизация VK завершена")
         entry = build_entry(cookies, user_id)
+        logger.info("Данные сессии прошли проверку перед сохранением")
         target = args.output
         if target is None:
             target = _read_line("Укажите путь к JSON-файлу для cookies: ")
             if not target:
                 raise VkpwError("Путь к файлу не задан, cookies не сохранены")
+        logger.info("Записываю данные сессии в указанный файл")
         saved = append_entry(Path(target), entry)
+        logger.info("Cookies успешно сохранены")
     except VkpwError as exc:
+        logger.info("Ошибка в процессе входа: %s", exc)
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        logger.info("Вход отменён пользователем")
         print("\nВход отменён.", file=sys.stderr)
         return 130
+    finally:
+        if log_handler is not None:
+            logger.removeHandler(log_handler)
+            log_handler.close()
+            logger.setLevel(previous_level)
+            logger.propagate = previous_propagate
 
     print(f"OK: user_id={user_id}, cookies сохранены в {saved.resolve()}", file=sys.stderr)
     return 0
