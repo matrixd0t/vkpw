@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import unittest
 import urllib.parse
 from unittest.mock import AsyncMock, Mock, patch
@@ -11,11 +12,13 @@ from vkpw.auth import (
     REQUIRED_COOKIES,
     WEB_TOKEN_APP_ID,
     BrowserSession,
+    _wait_for_password_field,
     authenticate,
     build_auth_url,
     extract_session_cookies,
     verify_session,
 )
+from vkpw.errors import ManualVerificationRequired
 
 
 class FakeOpener:
@@ -92,6 +95,111 @@ class _FakeLocator:
         pass
 
 
+class _FakeBodyLocator:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def inner_text(self, timeout: int) -> str:
+        if self.page.state == "code":
+            if time.monotonic() - self.page.started_at < self.page.countdown_after:
+                return self.page.challenge_text.replace("00:30", "")
+            return self.page.challenge_text
+        if self.page.state == "methods":
+            return "Select verification method"
+        return "Enter your account password"
+
+
+class _FakePasswordLocator(_FakeLocator):
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return self.page.state == "password"
+
+
+class _FakeOtherMethodsButton:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return self.page.state == "code" and self.page.has_other_methods_button
+
+    async def click(self, timeout: int) -> None:
+        self.page.state = "methods"
+
+
+class _FakeTextCandidate:
+    def __init__(self, page, label: str) -> None:
+        self.page = page
+        self.label = label
+
+    async def is_visible(self) -> bool:
+        return self.label in self.page.labels_for_state()
+
+    async def click(self, timeout: int) -> None:
+        if self.page.state == "code" and self.label == self.page.other_options_label:
+            self.page.state = "methods"
+        elif self.page.state == "methods" and self.label == self.page.password_label:
+            self.page.state = "password"
+
+
+class _FakeTextMatches:
+    def __init__(self, page, pattern) -> None:
+        self.page = page
+        self.pattern = pattern
+
+    def matches(self) -> list[str]:
+        return [label for label in self.page.labels_for_state() if self.pattern.search(label)]
+
+    async def count(self) -> int:
+        return len(self.matches())
+
+    def nth(self, index: int) -> _FakeTextCandidate:
+        return _FakeTextCandidate(self.page, self.matches()[index])
+
+
+class _FakeMethodPage:
+    def __init__(
+        self,
+        other_options_label: str,
+        password_label: str,
+        *,
+        reveal_after: float = 0,
+        countdown_after: float = 0,
+        has_other_methods_button: bool = False,
+        challenge_text: str = "Enter code 00:30",
+    ) -> None:
+        self.state = "code"
+        self.other_options_label = other_options_label
+        self.password_label = password_label
+        self.reveal_after = reveal_after
+        self.countdown_after = countdown_after
+        self.has_other_methods_button = has_other_methods_button
+        self.started_at = time.monotonic()
+        self.challenge_text = challenge_text
+
+    def labels_for_state(self) -> list[str]:
+        if self.state == "code":
+            if time.monotonic() - self.started_at < self.reveal_after:
+                return []
+            return [self.other_options_label] if self.other_options_label else []
+        if self.state == "methods":
+            return [self.password_label]
+        return []
+
+    def locator(self, selector: str):
+        if selector == "body":
+            return _FakeBodyLocator(self)
+        if selector == 'input[name="password"]':
+            return _FakePasswordLocator(self)
+        if selector == '[data-test-id="other-verification-methods"]':
+            return _FakeOtherMethodsButton(self)
+        return _FakeLocator()
+
+    def get_by_text(self, pattern):
+        return _FakeTextMatches(self, pattern)
+
+
 class _FakeAuthPage:
     def __init__(self) -> None:
         self.login_locator = _FakeLocator()
@@ -128,6 +236,85 @@ class _FakePlaywrightManager:
 
 
 class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_max_code_screen_switches_to_offered_password_method(self) -> None:
+        for other_options, password in (
+            ("Other confirmation options", "Password"),
+            ("Другие варианты", "Пароль"),
+        ):
+            with self.subTest(language=other_options):
+                page = _FakeMethodPage(other_options, password)
+                field = await _wait_for_password_field(
+                    page,
+                    timeout=1,
+                    manual_challenge=None,
+                )
+                self.assertEqual(page.state, "password")
+                self.assertTrue(await field.is_visible())
+
+    async def test_other_verification_methods_test_id_works_without_text_marker(self) -> None:
+        page = _FakeMethodPage(
+            "",
+            "Password",
+            has_other_methods_button=True,
+            challenge_text="Вам поступил звонок-сброс. Введите последние 6 цифр номера.",
+        )
+        field = await _wait_for_password_field(
+            page,
+            timeout=1,
+            manual_challenge=None,
+        )
+
+        self.assertEqual(page.state, "password")
+        self.assertTrue(await field.is_visible())
+
+    async def test_waits_for_other_methods_button_after_max_countdown(self) -> None:
+        page = _FakeMethodPage(
+            "Other confirmation options",
+            "Password",
+            reveal_after=0.02,
+        )
+        with patch("vkpw.auth._MAX_METHOD_WAIT", 1):
+            field = await _wait_for_password_field(
+                page,
+                timeout=2,
+                manual_challenge=None,
+            )
+
+        self.assertEqual(page.state, "password")
+        self.assertTrue(await field.is_visible())
+
+    async def test_waits_for_countdown_to_render_before_manual_challenge_error(self) -> None:
+        page = _FakeMethodPage(
+            "Other confirmation options",
+            "Password",
+            reveal_after=0.04,
+            countdown_after=0.02,
+        )
+        with (
+            patch("vkpw.auth._CHALLENGE_SETTLE_WAIT", 0.5),
+            patch("vkpw.auth._MAX_METHOD_WAIT", 1),
+        ):
+            field = await _wait_for_password_field(
+                page,
+                timeout=2,
+                manual_challenge=None,
+            )
+
+        self.assertEqual(page.state, "password")
+        self.assertTrue(await field.is_visible())
+
+    async def test_code_screen_without_password_alternative_requires_manual_verification(self) -> None:
+        page = _FakeMethodPage(
+            "",
+            "Password",
+            challenge_text="Verification code required",
+        )
+        with (
+            patch("vkpw.auth._CHALLENGE_SETTLE_WAIT", 0.01),
+            self.assertRaises(ManualVerificationRequired),
+        ):
+            await _wait_for_password_field(page, timeout=1, manual_challenge=None)
+
     async def test_authentication_uses_fresh_context_without_profile_state(self) -> None:
         browser = _FakeAuthBrowser()
         session = BrowserSession(123, {"p": "p-value", "remixsid": "sid-value"})
@@ -137,6 +324,11 @@ class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
             patch("vkpw.auth._handle_manual_challenge", new_callable=AsyncMock),
             patch("vkpw.auth._click_continue", new_callable=AsyncMock),
             patch("vkpw.auth._wait_for_visible", new_callable=AsyncMock, return_value=_FakeLocator()),
+            patch(
+                "vkpw.auth._wait_for_password_field",
+                new_callable=AsyncMock,
+                return_value=_FakeLocator(),
+            ),
             patch(
                 "vkpw.auth._wait_for_session_cookies",
                 new_callable=AsyncMock,

@@ -32,17 +32,23 @@ API_VERSION = "5.199"
 REQUIRED_COOKIES = ("p", "remixsid")
 DEFAULT_TIMEOUT = 60.0
 _INITIAL_DEVICE_COOKIE = "1920/1080/2/!!-!!!!"
+_CHALLENGE_SETTLE_WAIT = 5.0
+_MAX_METHOD_WAIT = 35.0
 _PHONE_RE = re.compile(r"^[+\d\s().-]+$")
+_METHOD_COUNTDOWN_MARKERS = ("00:", "seconds", "second", "секунд")
 _CHALLENGE_MARKERS = (
     "captcha",
     "капча",
     "капч",
     "не робот",
     "введите код",
+    "код из max",
     "одноразовый код",
     "код из sms",
     "подтвердите вход",
     "подтверждение входа",
+    "enter code",
+    "code from max",
     "verification code",
     "two-factor",
     "suspicious activity",
@@ -58,6 +64,12 @@ _LOGIN_ERROR_MARKERS = (
     "incorrect password",
     "wrong password",
 )
+_OTHER_CONFIRMATION_OPTIONS = re.compile(
+    r"(?:other\s+(?:(?:confirmation|verification)\s+)?(?:options?|methods?)|"
+    r"друг(?:ие|ой)\s+(?:вариант\w*|способ\w*|метод\w*))",
+    re.IGNORECASE,
+)
+_PASSWORD_METHOD = re.compile(r"^(?:password|пароль)$", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +357,125 @@ async def _click_continue(page: Any) -> None:
         raise VkpwError("Не нашёл кнопку «Продолжить» на странице VK ID") from exc
 
 
+async def _click_visible_text(page: Any, pattern: re.Pattern[str]) -> bool:
+    locator = page.get_by_text(pattern)
+    for index in range(await locator.count()):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            await candidate.click(timeout=3_000)
+        except PlaywrightError:
+            continue
+        return True
+    return False
+
+
+async def _click_other_verification_methods(page: Any) -> bool:
+    button = page.locator('[data-test-id="other-verification-methods"]')
+    try:
+        if not await button.is_visible():
+            return False
+        await button.click(timeout=3_000)
+    except PlaywrightError:
+        return False
+    return True
+
+
+async def _wait_for_password_field(
+    page: Any,
+    *,
+    timeout: float,
+    manual_challenge: ManualChallengeHandler | None,
+) -> Any:
+    """Wait for the password form, selecting VK's offered password method if needed."""
+    password_field = page.locator('input[name="password"]')
+    deadline = time.monotonic() + timeout
+    challenge_prompted = False
+    challenge_detected_at: float | None = None
+    options_opened = False
+    password_method_selected = False
+    countdown_deadline: float | None = None
+
+    while time.monotonic() < deadline:
+        if await password_field.is_visible():
+            return password_field
+        if await _has_login_error(page):
+            raise VkpwError("VK отклонил логин или запрос на вход")
+
+        if options_opened:
+            if await _click_visible_text(page, _PASSWORD_METHOD):
+                logger.info("В VK выбран штатный вход по паролю из других способов подтверждения")
+                options_opened = False
+                password_method_selected = True
+                deadline = time.monotonic() + timeout
+                continue
+        elif not password_method_selected:
+            if await _click_other_verification_methods(page):
+                logger.info("В VK открыты другие способы подтверждения")
+                options_opened = True
+                deadline = time.monotonic() + timeout
+                continue
+            if await _has_manual_challenge(page):
+                if await _click_visible_text(page, _OTHER_CONFIRMATION_OPTIONS):
+                    logger.info("В VK открыты другие способы подтверждения")
+                    options_opened = True
+                    deadline = time.monotonic() + timeout
+                    continue
+                body_text = await _body_text(page)
+                if any(marker in body_text for marker in _METHOD_COUNTDOWN_MARKERS):
+                    if countdown_deadline is None:
+                        countdown_deadline = time.monotonic() + min(_MAX_METHOD_WAIT, timeout)
+                        logger.info(
+                            "VK показывает таймер перед доступностью других способов подтверждения"
+                        )
+                    if time.monotonic() < countdown_deadline:
+                        await asyncio.sleep(0.25)
+                        continue
+                else:
+                    if challenge_detected_at is None:
+                        challenge_detected_at = time.monotonic()
+                    if time.monotonic() - challenge_detected_at < _CHALLENGE_SETTLE_WAIT:
+                        await asyncio.sleep(0.25)
+                        continue
+                if manual_challenge is None:
+                    logger.info("VK запросил дополнительную проверку при ожидании выбора метода входа")
+                    if countdown_deadline is not None:
+                        raise ManualVerificationRequired(
+                            "VK не показал другие способы подтверждения после ожидания таймера. "
+                            "Увеличьте --timeout или пройдите проверку вручную."
+                        )
+                    raise ManualVerificationRequired(
+                        "VK запросил CAPTCHA или дополнительное подтверждение. "
+                        "Автоматически такие проверки не обходятся."
+                    )
+                if not challenge_prompted:
+                    result = manual_challenge()
+                    if inspect.isawaitable(result):
+                        await result
+                    challenge_prompted = True
+                    deadline = time.monotonic() + timeout
+
+        await asyncio.sleep(0.25)
+
+    if options_opened:
+        raise ManualVerificationRequired(
+            "VK предложил другие способы подтверждения, но не удалось выбрать вход по паролю. "
+            "Требуется дополнительная проверка вручную."
+        )
+    if countdown_deadline is not None:
+        raise ManualVerificationRequired(
+            "VK не показал другие способы подтверждения до истечения таймаута. "
+            "Увеличьте --timeout или пройдите проверку вручную."
+        )
+    if challenge_detected_at is not None:
+        raise ManualVerificationRequired(
+            "VK запросил CAPTCHA или дополнительное подтверждение. "
+            "Автоматически такие проверки не обходятся."
+        )
+    raise VkpwError("Не дождался поля пароля в VK ID")
+
+
 async def _wait_for_session_cookies(
     page: Any,
     context: Any,
@@ -492,11 +623,9 @@ async def authenticate(
                 await _click_continue(page)
                 logger.info("Этап пройден: логин отправлен")
 
-                stage = "поиск поля пароля"
-                password_field = await _wait_for_visible(
+                stage = "выбор метода и поиск поля пароля"
+                password_field = await _wait_for_password_field(
                     page,
-                    'input[name="password"]',
-                    description="ввода пароля",
                     timeout=timeout,
                     manual_challenge=manual_challenge,
                 )
