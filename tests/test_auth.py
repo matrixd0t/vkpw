@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import time
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
+
+from playwright.async_api import Error as PlaywrightError
 
 from vkpw.auth import (
     AUTH_APP_ID,
@@ -18,7 +22,7 @@ from vkpw.auth import (
     extract_session_cookies,
     verify_session,
 )
-from vkpw.errors import ManualVerificationRequired
+from vkpw.errors import ManualVerificationRequired, VkpwError
 
 
 class FakeOpener:
@@ -203,6 +207,7 @@ class _FakeMethodPage:
 class _FakeAuthPage:
     def __init__(self) -> None:
         self.login_locator = _FakeLocator()
+        self.screenshot = AsyncMock()
 
     def locator(self, selector: str) -> _FakeLocator:
         return self.login_locator if selector == 'input[name="login"]' else _FakeLocator()
@@ -357,6 +362,120 @@ class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
                 }
             ]
         )
+        browser.close.assert_awaited_once()
+
+    async def _authenticate_with_password_field_error(
+        self,
+        *,
+        screenshot_path: str | Path | None,
+        error: Exception,
+        screenshot_side_effect: Exception | None = None,
+    ) -> tuple[_FakeAuthBrowser, Exception]:
+        browser = _FakeAuthBrowser()
+        if screenshot_side_effect is not None:
+            browser.context.page.screenshot.side_effect = screenshot_side_effect
+        with (
+            patch("vkpw.auth.async_playwright", return_value=_FakePlaywrightManager()),
+            patch("vkpw.auth.launch_chromium", new_callable=AsyncMock, return_value=browser),
+            patch("vkpw.auth._handle_manual_challenge", new_callable=AsyncMock),
+            patch("vkpw.auth._click_continue", new_callable=AsyncMock),
+            patch(
+                "vkpw.auth._wait_for_password_field",
+                new_callable=AsyncMock,
+                side_effect=error,
+            ),
+        ):
+            try:
+                await authenticate("1234567890", "secret", screenshot_path=screenshot_path)
+            except Exception as exc:  # noqa: BLE001 - тест проверяет тип ниже
+                return browser, exc
+        self.fail("authenticate должен был завершиться ошибкой")
+
+    async def test_failure_saves_screenshot_before_browser_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "screenshots" / "failure.png"
+            browser, exc = await self._authenticate_with_password_field_error(
+                screenshot_path=target,
+                error=VkpwError("VK отклонил логин"),
+            )
+
+            self.assertIsInstance(exc, VkpwError)
+            assert isinstance(exc, VkpwError)
+            self.assertEqual(exc.screenshot_path, target)
+            browser.context.page.screenshot.assert_awaited_once_with(
+                path=str(target), full_page=True, timeout=10_000
+            )
+            browser.close.assert_awaited_once()
+            self.assertTrue(target.parent.is_dir())
+
+    async def test_failure_without_screenshot_path_does_not_screenshot(self) -> None:
+        browser, exc = await self._authenticate_with_password_field_error(
+            screenshot_path=None,
+            error=VkpwError("VK отклонил логин"),
+        )
+
+        self.assertIsInstance(exc, VkpwError)
+        assert isinstance(exc, VkpwError)
+        self.assertIsNone(exc.screenshot_path)
+        browser.context.page.screenshot.assert_not_awaited()
+        browser.close.assert_awaited_once()
+
+    async def test_failure_screenshot_error_does_not_mask_original_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "failure.png"
+            browser, exc = await self._authenticate_with_password_field_error(
+                screenshot_path=target,
+                error=VkpwError("VK отклонил логин"),
+                screenshot_side_effect=RuntimeError("no disk"),
+            )
+
+            self.assertIsInstance(exc, VkpwError)
+            assert isinstance(exc, VkpwError)
+            self.assertEqual(str(exc), "VK отклонил логин")
+            self.assertIsNone(exc.screenshot_path)
+            browser.context.page.screenshot.assert_awaited_once()
+            browser.close.assert_awaited_once()
+
+    async def test_playwright_error_keeps_screenshot_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "failure.png"
+            browser, exc = await self._authenticate_with_password_field_error(
+                screenshot_path=str(target),
+                error=PlaywrightError("browser died"),
+            )
+
+            self.assertIsInstance(exc, VkpwError)
+            assert isinstance(exc, VkpwError)
+            self.assertEqual(exc.screenshot_path, target)
+            browser.context.page.screenshot.assert_awaited_once()
+            browser.close.assert_awaited_once()
+
+    async def test_success_does_not_screenshot(self) -> None:
+        browser = _FakeAuthBrowser()
+        session = BrowserSession(123, {"p": "p-value", "remixsid": "sid-value"})
+        with (
+            patch("vkpw.auth.async_playwright", return_value=_FakePlaywrightManager()),
+            patch("vkpw.auth.launch_chromium", new_callable=AsyncMock, return_value=browser),
+            patch("vkpw.auth._handle_manual_challenge", new_callable=AsyncMock),
+            patch("vkpw.auth._click_continue", new_callable=AsyncMock),
+            patch(
+                "vkpw.auth._wait_for_password_field",
+                new_callable=AsyncMock,
+                return_value=_FakeLocator(),
+            ),
+            patch(
+                "vkpw.auth._wait_for_session_cookies",
+                new_callable=AsyncMock,
+                return_value=session.cookies,
+            ),
+            patch("vkpw.auth.verify_session", return_value=session),
+        ):
+            result = await authenticate(
+                "1234567890", "secret", screenshot_path="/tmp/vkpw-failure.png"
+            )
+
+        self.assertEqual(result, session)
+        browser.context.page.screenshot.assert_not_awaited()
         browser.close.assert_awaited_once()
 
 

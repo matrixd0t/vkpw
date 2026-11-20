@@ -8,7 +8,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from vkpw.cli import _install_browser, _parse_credentials, main
+from vkpw.cli import _install_browser, _parse_credentials, _run_login, main
 from vkpw.errors import VkpwError
 
 
@@ -112,6 +112,47 @@ class CredentialsCliTests(unittest.TestCase):
             log_contents = log_file.read_text(encoding="utf-8")
             self.assertIn("Ошибка в процессе входа: VK отклонил вход", log_contents)
             self.assertNotIn("secret", log_contents)
+
+    def test_failure_screenshot_path_is_printed_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "cookies.json"
+            screenshot = Path(directory) / "failure.png"
+            error = VkpwError("VK отклонил вход")
+            error.screenshot_path = screenshot
+            stderr = io.StringIO()
+            with (
+                patch("vkpw.cli._setup_streams"),
+                patch("vkpw.cli.sys.stdin", Mock(isatty=Mock(return_value=False))),
+                patch(
+                    "vkpw.cli._run_login",
+                    new_callable=AsyncMock,
+                    side_effect=error,
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = main(
+                    ["login:secret", "-o", str(output), "-i", str(screenshot)]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn(f"Скриншот при ошибке: {screenshot}", stderr.getvalue())
+
+    def test_run_login_forwards_image_path(self) -> None:
+        import argparse
+        import asyncio
+
+        session = Mock(user_id=123, cookies={"p": "p", "remixsid": "s"})
+        args = argparse.Namespace(
+            browser_path=None,
+            timeout=60.0,
+            image="screenshot.png",
+        )
+        with patch("vkpw.cli.authenticate", new_callable=AsyncMock, return_value=session) as auth:
+            result = asyncio.run(_run_login(args, login="login", password="secret"))
+
+        self.assertEqual(result, (123, {"p": "p", "remixsid": "s"}))
+        auth.assert_awaited_once()
+        self.assertEqual(auth.await_args.kwargs["screenshot_path"], "screenshot.png")
 
 
 class BrowserInstallCliTests(unittest.TestCase):

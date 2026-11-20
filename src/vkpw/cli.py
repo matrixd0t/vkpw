@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Путь к установленному Chromium/Chrome/Edge/Brave",
     )
     parser.add_argument(
+        "-i",
+        "--image",
+        metavar="FILE",
+        help="PNG-скриншот страницы при неудачной авторизации (без флага не делается)",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
@@ -121,6 +127,7 @@ async def _run_login(args: argparse.Namespace, *, login: str, password: str) -> 
         password,
         browser_path=args.browser_path,
         timeout=args.timeout,
+        screenshot_path=getattr(args, "image", None),
     )
     return session.user_id, session.cookies
 
@@ -210,6 +217,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except VkpwError as exc:
         logger.info("Ошибка в процессе входа: %s", exc)
         print(f"Ошибка: {exc}", file=sys.stderr)
+        if exc.screenshot_path is not None:
+            logger.info("Скриншот при ошибке: %s", exc.screenshot_path)
+            print(f"Скриншот при ошибке: {exc.screenshot_path}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         logger.info("Вход отменён пользователем")

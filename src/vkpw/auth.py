@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from playwright.async_api import Error as PlaywrightError
@@ -510,6 +511,18 @@ async def _wait_for_session_cookies(
     raise VkpwError("После входа браузер не получил обязательные cookies p и remixsid")
 
 
+async def _capture_failure_screenshot(page: Any, target: Path) -> Path | None:
+    """Сохранить скриншот текущей страницы для диагностики сбоя; путь не логируется как секрет."""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await page.screenshot(path=str(target), full_page=True, timeout=10_000)
+    except (PlaywrightError, OSError, RuntimeError) as exc:
+        logger.info("Не удалось сохранить скриншот при ошибке (%s)", type(exc).__name__)
+        return None
+    logger.info("Скриншот при ошибке сохранён: %s", target)
+    return target
+
+
 async def authenticate(
     login: str,
     password: str,
@@ -517,11 +530,19 @@ async def authenticate(
     browser_path: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     manual_challenge: ManualChallengeHandler | None = None,
+    screenshot_path: str | Path | None = None,
 ) -> BrowserSession:
-    """Войти через штатную страницу VK ID и вернуть подтверждённые cookies."""
+    """Войти через штатную страницу VK ID и вернуть подтверждённые cookies.
+
+    Если задан ``screenshot_path``, при неудаче после создания страницы
+    текущая страница сохраняется в PNG по этому пути уже перед закрытием
+    браузера. Если не задан, скриншот не делается.
+    """
     logger.info("Начата авторизация VK")
     stage = "проверка входных данных"
     cleanup_failed = False
+    failure_screenshot: Path | None = None
+    screenshot_target = Path(screenshot_path).expanduser() if screenshot_path else None
     try:
         if not login.strip():
             raise VkpwError("Логин не должен быть пустым")
@@ -541,6 +562,7 @@ async def authenticate(
                 browser_path=browser_path,
             )
             logger.info("Этап пройден: браузер запущен в headless-режиме")
+            page: Any = None
             try:
                 stage = "создание чистого контекста браузера"
                 context = await browser.new_context(locale="ru-RU")
@@ -649,6 +671,12 @@ async def authenticate(
                 session = await asyncio.to_thread(verify_session, browser_cookies)
                 logger.info("Этап пройден: сессия подтверждена VK")
                 return session
+            except BaseException:
+                if screenshot_target is not None and page is not None:
+                    failure_screenshot = await _capture_failure_screenshot(
+                        page, screenshot_target
+                    )
+                raise
             finally:
                 logger.info("Этап начат: закрытие временного браузера")
                 try:
@@ -662,6 +690,8 @@ async def authenticate(
                     raise
                 logger.info("Этап пройден: временный браузер закрыт")
     except VkpwError as exc:
+        if failure_screenshot is not None and exc.screenshot_path is None:
+            exc.screenshot_path = failure_screenshot
         if not cleanup_failed:
             logger.info("Этап завершился ошибкой: %s — %s", stage, exc)
         raise
@@ -672,8 +702,12 @@ async def authenticate(
                 stage,
                 type(exc).__name__,
             )
-        raise VkpwError(f"Ошибка управления браузером ({type(exc).__name__})") from exc
+        error = VkpwError(f"Ошибка управления браузером ({type(exc).__name__})")
+        error.screenshot_path = failure_screenshot
+        raise error from exc
     except Exception as exc:
+        if failure_screenshot is not None and getattr(exc, "screenshot_path", None) is None:
+            exc.screenshot_path = failure_screenshot  # type: ignore[attr-defined]
         if not cleanup_failed:
             logger.info(
                 "Этап завершился неожиданной ошибкой: %s (%s)",
