@@ -6,6 +6,7 @@ import http.cookiejar
 import inspect
 import json
 import logging
+import os
 import re
 import secrets
 import string
@@ -562,6 +563,21 @@ async def _capture_failure_screenshot(page: Any, target: Path) -> Path | None:
     return target
 
 
+async def _capture_failure_html(page: Any, target: Path) -> Path | None:
+    """Сохранить HTML текущей страницы для диагностики сбоя; путь не логируется как секрет."""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        content = await page.content()
+        target.write_text(content, encoding="utf-8")
+        if os.name != "nt":
+            target.chmod(0o600)
+    except (PlaywrightError, OSError, RuntimeError, UnicodeError) as exc:
+        logger.info("Не удалось сохранить HTML при ошибке (%s)", type(exc).__name__)
+        return None
+    logger.info("HTML при ошибке сохранён: %s", target)
+    return target
+
+
 async def _close_page(page: Any) -> bool:
     try:
         await page.close()
@@ -619,18 +635,22 @@ async def authenticate(
     timeout: float = DEFAULT_TIMEOUT,
     manual_challenge: ManualChallengeHandler | None = None,
     screenshot_path: str | Path | None = None,
+    html_path: str | Path | None = None,
 ) -> BrowserSession:
     """Войти через штатную страницу VK ID и вернуть подтверждённые cookies.
 
     Если задан ``screenshot_path``, при неудаче после создания страницы
     текущая страница сохраняется в PNG по этому пути уже перед закрытием
-    браузера. Если не задан, скриншот не делается.
+    браузера. Если задан ``html_path``, там же сохраняется HTML этой
+    страницы. Если пути не заданы, файлы не создаются.
     """
     logger.info("Начата авторизация VK")
     stage = "проверка входных данных"
     cleanup_failed = False
     failure_screenshot: Path | None = None
+    failure_html: Path | None = None
     screenshot_target = Path(screenshot_path).expanduser() if screenshot_path else None
+    html_target = Path(html_path).expanduser() if html_path else None
     try:
         if not login.strip():
             raise VkpwError("Логин не должен быть пустым")
@@ -760,10 +780,13 @@ async def authenticate(
                 logger.info("Этап пройден: сессия подтверждена VK")
                 return session
             except BaseException:
-                if screenshot_target is not None and page is not None:
-                    failure_screenshot = await _capture_failure_screenshot(
-                        page, screenshot_target
-                    )
+                if page is not None:
+                    if screenshot_target is not None:
+                        failure_screenshot = await _capture_failure_screenshot(
+                            page, screenshot_target
+                        )
+                    if html_target is not None:
+                        failure_html = await _capture_failure_html(page, html_target)
                 raise
             finally:
                 logger.info("Этап начат: закрытие временного браузера")
@@ -780,6 +803,8 @@ async def authenticate(
     except VkpwError as exc:
         if failure_screenshot is not None and exc.screenshot_path is None:
             exc.screenshot_path = failure_screenshot
+        if failure_html is not None and exc.html_path is None:
+            exc.html_path = failure_html
         if not cleanup_failed:
             logger.info("Этап завершился ошибкой: %s — %s", stage, exc)
         raise
@@ -792,10 +817,13 @@ async def authenticate(
             )
         error = VkpwError(f"Ошибка управления браузером ({type(exc).__name__})")
         error.screenshot_path = failure_screenshot
+        error.html_path = failure_html
         raise error from exc
     except Exception as exc:
         if failure_screenshot is not None and getattr(exc, "screenshot_path", None) is None:
             exc.screenshot_path = failure_screenshot  # type: ignore[attr-defined]
+        if failure_html is not None and getattr(exc, "html_path", None) is None:
+            exc.html_path = failure_html  # type: ignore[attr-defined]
         if not cleanup_failed:
             logger.info(
                 "Этап завершился неожиданной ошибкой: %s (%s)",

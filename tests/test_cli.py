@@ -154,6 +154,48 @@ class CredentialsCliTests(unittest.TestCase):
         auth.assert_awaited_once()
         self.assertEqual(auth.await_args.kwargs["screenshot_path"], "screenshot.png")
 
+    def test_failure_html_path_is_printed_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "cookies.json"
+            html = Path(directory) / "failure.html"
+            error = VkpwError("VK отклонил вход")
+            error.html_path = html
+            stderr = io.StringIO()
+            with (
+                patch("vkpw.cli._setup_streams"),
+                patch("vkpw.cli.sys.stdin", Mock(isatty=Mock(return_value=False))),
+                patch(
+                    "vkpw.cli._run_login",
+                    new_callable=AsyncMock,
+                    side_effect=error,
+                ),
+                redirect_stderr(stderr),
+            ):
+                result = main(
+                    ["login:secret", "-o", str(output), "--html", str(html)]
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn(f"HTML при ошибке: {html}", stderr.getvalue())
+
+    def test_run_login_forwards_html_path(self) -> None:
+        import argparse
+        import asyncio
+
+        session = Mock(user_id=123, cookies={"p": "p", "remixsid": "s"})
+        args = argparse.Namespace(
+            browser_path=None,
+            timeout=60.0,
+            image=None,
+            html="failure.html",
+        )
+        with patch("vkpw.cli.authenticate", new_callable=AsyncMock, return_value=session) as auth:
+            result = asyncio.run(_run_login(args, login="login", password="secret"))
+
+        self.assertEqual(result, (123, {"p": "p", "remixsid": "s"}))
+        auth.assert_awaited_once()
+        self.assertEqual(auth.await_args.kwargs["html_path"], "failure.html")
+
 
 class BrowserInstallCliTests(unittest.TestCase):
     def test_install_browser_confirms_the_managed_executable_exists(self) -> None:

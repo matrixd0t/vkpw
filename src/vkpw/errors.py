@@ -9,6 +9,9 @@ class VkpwError(RuntimeError):
     screenshot_path: Path | None = None
     """Путь к скриншоту страницы при ошибке, если он сохранялся."""
 
+    html_path: Path | None = None
+    """Путь к HTML страницы при ошибке, если он сохранялся."""
+
 
 class BrowserNotFoundError(VkpwError):
     """Не найден совместимый браузер."""
