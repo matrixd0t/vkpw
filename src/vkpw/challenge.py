@@ -27,12 +27,26 @@ ROBOT_CHECK_MARKERS = (
 
 _ROBOT_CHECK_LABEL = re.compile(r"(?:я\s+не\s+робот|not\s+a\s+robot)", re.IGNORECASE)
 _CAPTCHA_FRAME_MARKERS = ("captcha", "robot-check", "robotcheck")
+_SLIDER_MARKERS = (
+    "потяните вправо",
+    "тяните ползунок",
+    "slide to the right",
+    "drag the slider",
+)
 _CHECKBOX_SELECTORS = (
+    # Видимый квадрат чекбокса VKUI в окне not_robot_captcha (24x24).
+    '[data-test-id="not-robot-captcha-checkbox"]',
+    '[data-test-id="not-robot-captcha-checkbox-input"]',
     '[role="checkbox"]',
     'input[type="checkbox"]',
     '[data-testid*="checkbox" i]',
     '[class*="checkbox" i]',
 )
+# Реальный квадрат чекбокса/иконка/скрытый input — не больше нескольких
+# десятков пикселей. Контейнеры (модальное окно 344x370, заголовок,
+# обёртки с классом *checkbox*) под эти селекторы тоже попадают, но
+# кликать по их центру нельзя: центр модалки — не чекбокс.
+_MAX_CONTROL_SIZE = 64.0
 _LABELED_CONTROL_SELECTORS = (
     '[aria-label*="робот" i]',
     '[aria-label*="robot" i]',
@@ -151,6 +165,15 @@ async def has_robot_check(page: Any) -> bool:
     return await find_robot_check(page) is not None
 
 
+async def has_slider_challenge(page: Any) -> bool:
+    """Показана ли вторая ступень: слайдер «Потяните вправо»."""
+    for frame in _page_frames(page):
+        text = await _frame_text(frame)
+        if any(marker in text for marker in _SLIDER_MARKERS):
+            return True
+    return False
+
+
 async def _find_label(frame: Any) -> Any | None:
     """Найти наименьший видимый элемент с подписью «Я не робот»."""
     try:
@@ -174,24 +197,48 @@ async def _find_label(frame: Any) -> Any | None:
     return best
 
 
+def _is_checkbox_sized(box: dict[str, float]) -> bool:
+    """Квадрат/иконка/скрытый input чекбокса, а не контейнер окна проверки."""
+    return 0 < box["width"] <= _MAX_CONTROL_SIZE and 0 < box["height"] <= _MAX_CONTROL_SIZE
+
+
 def _is_beside_label(box: dict[str, float], label_box: dict[str, float]) -> bool:
-    """Чекбокс расположен слева от подписи на той же строке."""
+    """Чекбокс расположен слева от подписи на той же строке.
+
+    Контейнер (например, модальное окно) содержит подпись целиком, а не
+    находится слева от неё, поэтому простое пересечение прямоугольников
+    признаком чекбокса не является.
+    """
     if box["y"] + box["height"] < label_box["y"] - 4:
         return False
     if box["y"] > label_box["y"] + label_box["height"] + 4:
         return False
-    if box["x"] < label_box["x"] + label_box["width"] and box["x"] + box["width"] > label_box["x"]:
+    # Маленький квадрат может находиться внутри элемента <label> целиком.
+    if (
+        box["x"] >= label_box["x"] - 4
+        and box["x"] + box["width"] <= label_box["x"] + label_box["width"] + 4
+        and box["y"] >= label_box["y"] - 4
+        and box["y"] + box["height"] <= label_box["y"] + label_box["height"] + 4
+    ):
         return True
     return -12.0 <= label_box["x"] - (box["x"] + box["width"]) <= 120.0
 
 
 async def _click_dom_checkbox(frame: Any, label_box: dict[str, float] | None) -> bool:
-    """Кликнуть по настоящему чекбоксу рядом с подписью."""
-    for selector in (*_LABELED_CONTROL_SELECTORS, *_CHECKBOX_SELECTORS):
+    """Кликнуть по настоящему чекбоксу рядом с подписью.
+
+    Сначала точные селекторы квадрата чекбокса, затем элементы с подписью
+    «Я не робот». Крупные контейнеры отсекаются по размеру и геометрии:
+    без этого `[aria-label*="робот"]` первым находит всё модальное окно
+    (344x370) и клик уходит в его центр — выше чекбокса, без переключения.
+    """
+    for selector in (*_CHECKBOX_SELECTORS, *_LABELED_CONTROL_SELECTORS):
         for candidate in await _locator_elements(frame, selector, 10):
             if not await _is_visible(candidate):
                 continue
             box = await _safe_bounding_box(candidate)
+            if box is not None and not _is_checkbox_sized(box):
+                continue
             if label_box is not None and box is not None and not _is_beside_label(
                 box, label_box
             ):
@@ -215,12 +262,28 @@ async def _click_offset(page: Any, label_box: dict[str, float]) -> bool:
 
 
 async def _wait_cleared(page: Any, *, deadline: float) -> bool:
-    """Ждать, пока окно проверки исчезнет."""
+    """Ждать, пока окно проверки исчезнет.
+
+    Если после клика VK вместо пропуска показывает слайдер, это не
+    «пройдено»: дальнейшие попытки кликать чекбокс бессмысленны.
+    """
     settle_deadline = min(deadline, time.monotonic() + _SETTLE_SECONDS)
     while time.monotonic() < settle_deadline:
+        if await has_slider_challenge(page):
+            logger.info(
+                "После клика по чекбоксу VK показал слайдер «Потяните вправо» — "
+                "чекбокс автоматически не засчитан"
+            )
+            return False
         if not await has_robot_check(page):
             return True
         await asyncio.sleep(_POLL_INTERVAL)
+    if await has_slider_challenge(page):
+        logger.info(
+            "После клика по чекбоксу VK показал слайдер «Потяните вправо» — "
+            "чекбокс автоматически не засчитан"
+        )
+        return False
     return not await has_robot_check(page)
 
 
@@ -231,6 +294,13 @@ async def solve_robot_check(page: Any, *, timeout: float = _RESOLVE_TIMEOUT) -> 
     показал другую проверку, возвращается `False` — вызывающий код переходит
     к ручному подтверждению.
     """
+    if await has_slider_challenge(page):
+        logger.info(
+            "VK уже показал слайдер «Потяните вправо» вместо чекбокса — "
+            "автоматический проход недоступен"
+        )
+        return False
+
     frame = await find_robot_check(page)
     if frame is None:
         return False

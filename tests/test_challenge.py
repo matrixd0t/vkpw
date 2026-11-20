@@ -228,6 +228,67 @@ class RobotCheckTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(solved)
         self.assertEqual(checkbox.clicks, 1)
 
+    async def test_modal_container_is_not_clicked_instead_of_checkbox(self) -> None:
+        # Живая структура not_robot_captcha: [aria-label*="робот"] первым
+        # находит всё модальное окно 344x370, а квадрат чекбокса — 24x24
+        # слева от подписи. Клик по центру модалки чекбокс не переключает.
+        frame = _robot_frame()
+        label = _FakeElement(box={"x": 935.0, "y": 595.0, "width": 85.0, "height": 20.0})
+        frame.labels = [label]
+        modal = _FakeElement(box={"x": 788.0, "y": 355.0, "width": 344.0, "height": 370.0})
+        frame.labeled = [modal]
+
+        def clear_check() -> None:
+            frame.text = ""
+            frame.labeled = []
+
+        control = _FakeElement(
+            box={"x": 899.0, "y": 593.0, "width": 24.0, "height": 24.0},
+            on_click=clear_check,
+        )
+        frame.checkboxes = [modal, control]
+        page = _FakePage([frame])
+
+        with patch("vkpw.challenge._SETTLE_SECONDS", 0.2):
+            solved = await solve_robot_check(page)
+
+        self.assertTrue(solved)
+        self.assertEqual(modal.clicks, 0)
+        self.assertEqual(control.clicks, 1)
+
+    async def test_slider_after_checkbox_is_not_reported_as_solved(self) -> None:
+        frame = _robot_frame()
+        label = _FakeElement(box=LABEL_BOX)
+        frame.labels = [label]
+
+        def escalate_to_slider() -> None:
+            frame.text = "Обновить\nПотяните вправо\nТяните ползунок вправо"
+
+        checkbox = _FakeElement(box=CHECKBOX_BOX, on_click=escalate_to_slider)
+        frame.checkboxes = [checkbox]
+        page = _FakePage([frame])
+
+        with patch("vkpw.challenge._SETTLE_SECONDS", 0.2):
+            solved = await solve_robot_check(page)
+
+        self.assertFalse(solved)
+        self.assertEqual(checkbox.clicks, 1)
+
+    async def test_slider_without_checkbox_is_not_clicked(self) -> None:
+        frame = _FakeFrame(
+            text="Обновить\nПотяните вправо\nТяните ползунок вправо, пока не соберётся картинка"
+        )
+        checkbox = _FakeElement(box=CHECKBOX_BOX)
+        frame.checkboxes = [checkbox]
+        page = _FakePage([frame])
+
+        with patch("vkpw.challenge._SETTLE_SECONDS", 0.2):
+            solved = await solve_robot_check(page)
+
+        self.assertFalse(solved)
+        self.assertEqual(checkbox.clicks, 0)
+        self.assertEqual(page.mouse.clicks, [])
+
 
 if __name__ == "__main__":
     unittest.main()
