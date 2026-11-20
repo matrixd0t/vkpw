@@ -86,11 +86,13 @@ async def launch_chromium(
 ) -> Any:
     """Запустить браузер в headless-режиме и во временном профиле Playwright."""
     path = find_system_browser(browser_path)
+    launch_args = ["--disable-blink-features=AutomationControlled"]
     if path is not None:
         try:
             return await playwright.chromium.launch(
                 executable_path=str(path),
                 headless=True,
+                args=launch_args,
             )
         except PlaywrightError as exc:
             bundled = Path(playwright.chromium.executable_path)
@@ -104,7 +106,7 @@ async def launch_chromium(
     bundled = Path(playwright.chromium.executable_path)
     if bundled.is_file():
         try:
-            return await playwright.chromium.launch(headless=True)
+            return await playwright.chromium.launch(headless=True, args=launch_args)
         except PlaywrightError as exc:
             raise BrowserNotFoundError(
                 f"Не удалось запустить Chromium Playwright ({type(exc).__name__})."

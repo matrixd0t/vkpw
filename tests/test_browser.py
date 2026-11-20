@@ -37,6 +37,7 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["executable_path"], str(browser_path.resolve()))
             self.assertTrue(result["headless"])
             self.assertNotIn("user_data_dir", result)
+            self.assertIn("--disable-blink-features=AutomationControlled", result["args"])
 
     async def test_launch_uses_bundled_browser_headlessly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -48,7 +49,13 @@ class BrowserTests(unittest.IsolatedAsyncioTestCase):
             with patch("vkpw.browser.find_system_browser", return_value=None):
                 result = await launch_chromium(playwright)
 
-            self.assertEqual(result, {"headless": True})
+            self.assertEqual(
+                result,
+                {
+                    "headless": True,
+                    "args": ["--disable-blink-features=AutomationControlled"],
+                },
+            )
 
     async def test_missing_explicit_browser_is_reported(self) -> None:
         with self.assertRaises(BrowserNotFoundError):

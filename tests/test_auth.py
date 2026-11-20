@@ -208,6 +208,13 @@ class _FakeAuthPage:
     def __init__(self) -> None:
         self.login_locator = _FakeLocator()
         self.screenshot = AsyncMock()
+        self.evaluate = AsyncMock(
+            return_value=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+        )
+        self.close = AsyncMock()
 
     def locator(self, selector: str) -> _FakeLocator:
         return self.login_locator if selector == 'input[name="login"]' else _FakeLocator()
@@ -220,6 +227,8 @@ class _FakeAuthContext:
     def __init__(self) -> None:
         self.page = _FakeAuthPage()
         self.add_cookies = AsyncMock()
+        self.add_init_script = AsyncMock()
+        self.close = AsyncMock()
 
     async def new_page(self) -> _FakeAuthPage:
         return self.page
@@ -230,6 +239,107 @@ class _FakeAuthBrowser:
         self.context = _FakeAuthContext()
         self.new_context = AsyncMock(return_value=self.context)
         self.close = AsyncMock()
+
+
+class _FakeRobotBody:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def inner_text(self, timeout: int | None = None) -> str:
+        if self.page.state == "robot":
+            return "Подтвердите, что вы не робот\nЯ не робот"
+        return "Введите пароль от аккаунта"
+
+
+class _FakeRobotPasswordLocator(_FakeLocator):
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return self.page.state == "password"
+
+
+class _FakeRobotHiddenLocator(_FakeLocator):
+    async def is_visible(self) -> bool:
+        return False
+
+
+class _FakeRobotCheckboxElement:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return self.page.state == "robot"
+
+    async def bounding_box(self):
+        return {"x": 580.0, "y": 414.0, "width": 16.0, "height": 16.0}
+
+    async def click(self, timeout: int | None = None) -> None:
+        self.page.checkbox_clicks += 1
+        self.page.state = "password"
+
+
+class _FakeRobotCheckboxLocator:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def count(self) -> int:
+        return 1 if self.page.state == "robot" else 0
+
+    def nth(self, index: int) -> _FakeRobotCheckboxElement:
+        return _FakeRobotCheckboxElement(self.page)
+
+
+class _FakeRobotLabelElement:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def is_visible(self) -> bool:
+        return self.page.state == "robot"
+
+    async def bounding_box(self):
+        return {"x": 614.0, "y": 415.0, "width": 90.0, "height": 20.0}
+
+    async def click(self, timeout: int | None = None) -> None:
+        self.page.state = "password"
+
+
+class _FakeRobotLabels:
+    def __init__(self, page) -> None:
+        self.page = page
+
+    async def count(self) -> int:
+        return 1
+
+    def nth(self, index: int) -> _FakeRobotLabelElement:
+        return _FakeRobotLabelElement(self.page)
+
+
+class _FakeRobotPage:
+    """Страница VK ID: сначала окно «Я не робот», затем поле пароля."""
+
+    def __init__(self) -> None:
+        self.state = "robot"
+        self.checkbox_clicks = 0
+        self.main_frame = None
+
+    @property
+    def frames(self):
+        return [self]
+
+    def locator(self, selector: str):
+        if selector == "body":
+            return _FakeRobotBody(self)
+        if selector == 'input[name="password"]':
+            return _FakeRobotPasswordLocator(self)
+        if selector == '[data-test-id="other-verification-methods"]':
+            return _FakeRobotHiddenLocator()
+        if "captcha" in selector.lower():
+            return _FakeRobotHiddenLocator()
+        return _FakeRobotCheckboxLocator(self)
+
+    def get_by_text(self, pattern):
+        return _FakeRobotLabels(self)
 
 
 class _FakePlaywrightManager:
@@ -320,6 +430,19 @@ class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
         ):
             await _wait_for_password_field(page, timeout=1, manual_challenge=None)
 
+    async def test_robot_check_is_passed_without_manual_verification(self) -> None:
+        page = _FakeRobotPage()
+        with patch("vkpw.challenge._SETTLE_SECONDS", 0.2):
+            field = await _wait_for_password_field(
+                page,
+                timeout=2,
+                manual_challenge=None,
+            )
+
+        self.assertEqual(page.state, "password")
+        self.assertEqual(page.checkbox_clicks, 1)
+        self.assertTrue(await field.is_visible())
+
     async def test_authentication_uses_fresh_context_without_profile_state(self) -> None:
         browser = _FakeAuthBrowser()
         session = BrowserSession(123, {"p": "p-value", "remixsid": "sid-value"})
@@ -351,7 +474,11 @@ class AuthIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Этап пройден: сессия подтверждена VK", log_contents)
         self.assertNotIn("secret", log_contents)
         self.assertNotIn("p-value", log_contents)
-        browser.new_context.assert_awaited_once_with(locale="ru-RU")
+        browser.new_context.assert_awaited_once_with(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1920, "height": 1080},
+        )
         browser.context.add_cookies.assert_awaited_once_with(
             [
                 {

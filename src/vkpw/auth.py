@@ -22,6 +22,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from .browser import launch_chromium
+from .challenge import has_robot_check, solve_robot_check
 from .errors import ManualVerificationRequired, VkpwError
 
 AUTH_URL = "https://id.vk.ru/auth"
@@ -33,6 +34,11 @@ API_VERSION = "5.199"
 REQUIRED_COOKIES = ("p", "remixsid")
 DEFAULT_TIMEOUT = 60.0
 _INITIAL_DEVICE_COOKIE = "1920/1080/2/!!-!!!!"
+_VIEWPORT = {"width": 1920, "height": 1080}
+_TIMEZONE = "Europe/Moscow"
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+"""
 _CHALLENGE_SETTLE_WAIT = 5.0
 _MAX_METHOD_WAIT = 35.0
 _PHONE_RE = re.compile(r"^[+\d\s().-]+$")
@@ -305,6 +311,8 @@ async def _handle_manual_challenge(
 ) -> None:
     if not await _has_manual_challenge(page):
         return
+    if await _resolve_robot_check(page):
+        return
     logger.info("VK запросил дополнительную проверку; автоматический обход не выполняется")
     if handler is None:
         raise ManualVerificationRequired(
@@ -315,6 +323,19 @@ async def _handle_manual_challenge(
     if inspect.isawaitable(result):
         await result
     logger.info("Обработчик дополнительной проверки завершил работу")
+
+
+async def _resolve_robot_check(page: Any) -> bool:
+    """Попытаться пройти проверку VK «Я не робот» кликом по чекбоксу."""
+    if not await has_robot_check(page):
+        return False
+    logger.info("VK показал проверку «Я не робот», выполняю клик по чекбоксу")
+    solved = await solve_robot_check(page)
+    if solved:
+        logger.info("Этап пройден: проверка «Я не робот» пройдена")
+    else:
+        logger.info("Проверку «Я не робот» не удалось пройти автоматически")
+    return solved
 
 
 async def _wait_for_visible(
@@ -328,12 +349,18 @@ async def _wait_for_visible(
     locator = page.locator(selector)
     deadline = time.monotonic() + timeout
     prompted = False
+    robot_attempts = 0
     while time.monotonic() < deadline:
         if await locator.is_visible():
             return locator
         if await _has_login_error(page):
             raise VkpwError("VK отклонил логин или запрос на вход")
         if await _has_manual_challenge(page):
+            if robot_attempts < 2:
+                robot_attempts += 1
+                if await _resolve_robot_check(page):
+                    deadline = time.monotonic() + timeout
+                    continue
             if manual_challenge is None:
                 logger.info("VK запросил дополнительную проверку при ожидании этапа «%s»", description)
                 raise ManualVerificationRequired(
@@ -397,6 +424,7 @@ async def _wait_for_password_field(
     options_opened = False
     password_method_selected = False
     countdown_deadline: float | None = None
+    robot_attempts = 0
 
     while time.monotonic() < deadline:
         if await password_field.is_visible():
@@ -418,6 +446,11 @@ async def _wait_for_password_field(
                 deadline = time.monotonic() + timeout
                 continue
             if await _has_manual_challenge(page):
+                if robot_attempts < 2:
+                    robot_attempts += 1
+                    if await _resolve_robot_check(page):
+                        deadline = time.monotonic() + timeout
+                        continue
                 if await _click_visible_text(page, _OTHER_CONFIRMATION_OPTIONS):
                     logger.info("В VK открыты другие способы подтверждения")
                     options_opened = True
@@ -486,9 +519,15 @@ async def _wait_for_session_cookies(
 ) -> dict[str, str]:
     deadline = time.monotonic() + timeout
     prompted = False
+    robot_attempts = 0
     while time.monotonic() < deadline:
         cookies = extract_session_cookies(await context.cookies())
         if await _has_manual_challenge(page):
+            if robot_attempts < 2:
+                robot_attempts += 1
+                if await _resolve_robot_check(page):
+                    deadline = time.monotonic() + timeout
+                    continue
             if manual_challenge is None:
                 logger.info("VK запросил дополнительную проверку при ожидании cookies сессии")
                 raise ManualVerificationRequired(
@@ -521,6 +560,55 @@ async def _capture_failure_screenshot(page: Any, target: Path) -> Path | None:
         return None
     logger.info("Скриншот при ошибке сохранён: %s", target)
     return target
+
+
+async def _close_page(page: Any) -> bool:
+    try:
+        await page.close()
+    except Exception:  # noqa: BLE001 - страница могла уже закрыться
+        return False
+    return True
+
+
+async def _context_user_agent(context: Any) -> str:
+    """User-Agent, который браузер отдаёт VK: без служебного префикса."""
+    page = None
+    try:
+        page = await context.new_page()
+        user_agent = await page.evaluate("() => navigator.userAgent")
+    except Exception:  # noqa: BLE001 - страница может быть недоступна
+        return ""
+    finally:
+        if page is not None:
+            await _close_page(page)
+    return str(user_agent or "")
+
+
+async def _create_browser_context(browser: Any) -> Any:
+    """Создать контекст с реалистичным отпечатком браузера.
+
+    Размер окна совпадает с cookie устройства `remixmdevice`, часовой пояс
+    соответствует VK, а служебные признаки автоматизации убираются: VK
+    показывает проверку «Я не робот» заметно чаще при headless-отпечатке.
+    """
+    context = await browser.new_context(
+        locale="ru-RU",
+        timezone_id=_TIMEZONE,
+        viewport=dict(_VIEWPORT),
+    )
+    await context.add_init_script(_STEALTH_INIT_SCRIPT)
+    user_agent = await _context_user_agent(context)
+    if "Headless" not in user_agent:
+        return context
+    await context.close()
+    context = await browser.new_context(
+        locale="ru-RU",
+        timezone_id=_TIMEZONE,
+        viewport=dict(_VIEWPORT),
+        user_agent=user_agent.replace("Headless", ""),
+    )
+    await context.add_init_script(_STEALTH_INIT_SCRIPT)
+    return context
 
 
 async def authenticate(
@@ -565,7 +653,7 @@ async def authenticate(
             page: Any = None
             try:
                 stage = "создание чистого контекста браузера"
-                context = await browser.new_context(locale="ru-RU")
+                context = await _create_browser_context(browser)
                 logger.info("Этап пройден: создан новый временный контекст браузера")
 
                 stage = "установка начальной cookie устройства"
